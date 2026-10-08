@@ -51,6 +51,7 @@ def customer_actions(user_id, user=None):
 def main_keyboard(is_owner=False):
     rows = [[button("🛍 Каталог", "catalog:0")],
             [button("📦 Мои заказы", "orders:0"), button("💬 Поддержка", "s:open")],
+            [button("🎟 Ввести промокод", "promo")],
             [button("📄 Условия покупки", "terms")]]
     if is_owner:
         rows.append([button("⚙️ Панель владельца", "a:home")])

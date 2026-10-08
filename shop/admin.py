@@ -9,7 +9,7 @@ from typing import Any
 from telegram.error import BadRequest, TelegramError
 
 from .common import button, customer_actions, db, order_text, require_owner, show
-from .store import StoreError
+from .store import MAX_PROMO_ACTIVATIONS, StoreError, normalize_promo_code
 
 log = logging.getLogger(__name__)
 PAGE_SIZE = 8
@@ -94,6 +94,7 @@ async def _home(update, context) -> None:
         [button("📁 Категории", "a:categories:0"), button("🛍 Товары", "a:products:0")],
         [button("📦 Заказы", "a:orders:0"), button("💬 Клиенты", "a:users:0")],
         [button("📊 Статистика", "a:stats"), button("✏️ Настройки", "a:settings")],
+        [button("🎟 Промокоды", "a:promos:0")],
         [button("🏠 Магазин", "home")],
     ])
 
@@ -103,6 +104,53 @@ async def admin_command(update, context) -> None:
         return
     context.user_data.pop("flow", None)
     await _home(update, context)
+
+
+def _promo(context, promo_id: int) -> dict:
+    promo = db(context).get_promo(promo_id)
+    if not promo:
+        raise StoreError("Промокод удалён или не найден.")
+    return promo
+
+
+def _promo_limit(value: str) -> int | None:
+    number = _integer(value, 0, MAX_PROMO_ACTIVATIONS, "Лимит активаций")
+    return number or None
+
+
+async def _promos(update, context, offset: int = 0) -> None:
+    promos = db(context).list_promos(limit=PAGE_SIZE + 1, offset=offset)
+    rows = [[button(
+        f"{'🟢' if p['active'] else '⚪'} {_short(p['code'], 32)} · {p['activation_count']}",
+        f"a:promo:{p['id']}",
+    )] for p in promos[:PAGE_SIZE]]
+    page = _pager("a:promos", offset, len(promos) > PAGE_SIZE)
+    if page:
+        rows.append(page)
+    rows += [[button("➕ Создать промокод", "a:promo_add")], [button("← Панель", "a:home")]]
+    await show(update, "🎟 Промокоды\n\nПромокоды только учитывают активации: скидок и бонусов нет.\n"
+               + ("Выберите код для управления." if promos else "Промокодов на этой странице нет."), rows)
+
+
+async def _promo_card(update, context, promo_id: int) -> None:
+    promo = _promo(context, promo_id)
+    limit = promo['activation_limit']
+    status = "отключён" if not promo['active'] else (
+        "лимит исчерпан" if promo['activation_count'] >= (limit or MAX_PROMO_ACTIVATIONS) else "включён")
+    text = (f"🎟 Промокод: {promo['code']}\n\nСтатус: {status}\n"
+            f"Счётчик активаций: {promo['activation_count']}\n"
+            f"Клиентов в истории активаций: {promo['unique_activations']}\n"
+            f"Лимит активаций: {limit if limit is not None else 'без ограничений'}\n\n"
+            "Один клиент может активировать код один раз. Промокод не даёт скидок и бонусов.")
+    rows = [
+        [button("✏️ Изменить код", f"a:promo_rename:{promo_id}")],
+        [button("🔢 Изменить счётчик", f"a:promo_count:{promo_id}")],
+        [button("🎯 Изменить лимит", f"a:promo_limit:{promo_id}")],
+        [button("⏸ Отключить" if promo['active'] else "▶️ Включить", f"a:promo_toggle:{promo_id}")],
+        [button("🗑 Удалить", f"a:promo_delete:{promo_id}")],
+        [button("← Промокоды", "a:promos:0")],
+    ]
+    await show(update, text, rows)
 
 
 async def _categories(update, context, offset: int = 0) -> None:
@@ -334,10 +382,46 @@ async def admin_callback(update, context) -> None:
     try:
         if action == "home" and not args:
             await _home(update, context)
-        elif action in {"categories", "products", "orders", "users", "product_choose"}:
+        elif action in {"categories", "products", "orders", "users", "product_choose", "promos"}:
             offset, = numbers(1)
-            handlers = {"categories": _categories, "products": _products, "orders": _orders, "users": _users, "product_choose": _choose_category}
+            handlers = {"categories": _categories, "products": _products, "orders": _orders, "users": _users, "product_choose": _choose_category, "promos": _promos}
             await handlers[action](update, context, offset)
+        elif action == "promo":
+            promo_id, = numbers(1)
+            await _promo_card(update, context, promo_id)
+        elif action == "promo_add" and not args:
+            _flow(context, "promo_add", step="code")
+            await show(update, "Новый промокод · 1/2\nПришлите код: от 1 до 64 латинских или русских букв, цифр, _ или -.\n"
+                       "Без пробелов. Регистр букв не важен.\n\nОтмена: /cancel", _back("a:promos:0"))
+        elif action in {"promo_rename", "promo_count", "promo_limit"}:
+            promo_id, = numbers(1)
+            _promo(context, promo_id)
+            _flow(context, action, promo_id=promo_id)
+            prompts = {
+                "promo_rename": "Пришлите новый код: 1–64 латинских или русских букв, цифр, _ или -. Без пробелов. Регистр не важен.",
+                "promo_count": f"Пришлите новый счётчик от 0 до {MAX_PROMO_ACTIVATIONS}.\n"
+                               "Изменение счётчика не удаляет историю: те же клиенты не смогут активировать код повторно.\n"
+                               "Доступность активаций определяется этим счётчиком и лимитом.",
+                "promo_limit": f"Пришлите лимит активаций от 1 до {MAX_PROMO_ACTIVATIONS}.\nДля активаций без ограничения пришлите 0.\n"
+                               "Если счётчик достигнет лимита, новые активации будут недоступны.",
+            }
+            await show(update, prompts[action] + "\n\nОтмена: /cancel", _back(f"a:promo:{promo_id}"))
+        elif action == "promo_toggle":
+            promo_id, = numbers(1)
+            promo = _promo(context, promo_id)
+            db(context).update_promo(promo_id, active=not promo['active'])
+            await _promo_card(update, context, promo_id)
+        elif action in {"promo_delete", "promo_delete_confirm"}:
+            promo_id, = numbers(1)
+            promo = _promo(context, promo_id)
+            if action == "promo_delete":
+                await show(update, f"Удалить промокод «{promo['code']}» и историю его активаций?\n"
+                           "Если создать этот код заново, клиенты смогут активировать его снова.",
+                           [[button("Да, удалить", f"a:promo_delete_confirm:{promo_id}")],
+                            [button("Отмена", f"a:promo:{promo_id}")]])
+            else:
+                db(context).delete_promo(promo_id)
+                await _promos(update, context)
         elif action == "category":
             category_id, = numbers(1)
             await _category_card(update, context, category_id)
@@ -501,7 +585,38 @@ async def admin_input(update, context) -> bool:
     value = getattr(update.effective_message, "text", None) or ""
     kind = flow["kind"]
     try:
-        if kind == "admin_category_add":
+        if kind == "admin_promo_add":
+            if flow['step'] == 'code':
+                flow['code'] = normalize_promo_code(value)
+                flow['step'] = 'limit'
+                await show(update, f"Новый промокод · 2/2\nКод: {flow['code']}\n\n"
+                           f"Пришлите лимит активаций от 1 до {MAX_PROMO_ACTIVATIONS}.\n"
+                           "Для активаций без ограничения пришлите 0.\n\nОтмена: /cancel", _back("a:promos:0"))
+            elif flow['step'] == 'limit':
+                limit = _promo_limit(value)
+                try:
+                    promo_id = db(context).add_promo(flow['code'], limit)
+                except StoreError:
+                    flow['step'] = 'code'
+                    flow.pop('code', None)
+                    raise
+                context.user_data.pop('flow', None)
+                await _promo_card(update, context, promo_id)
+            else:
+                raise StoreError("Сценарий устарел. Начните создание промокода заново в /admin.")
+        elif kind in {"admin_promo_rename", "admin_promo_count", "admin_promo_limit"}:
+            promo_id = flow['promo_id']
+            _promo(context, promo_id)
+            if kind == 'admin_promo_rename':
+                fields = {'code': normalize_promo_code(value)}
+            elif kind == 'admin_promo_count':
+                fields = {'activation_count': _integer(value, 0, MAX_PROMO_ACTIVATIONS, "Счётчик активаций")}
+            else:
+                fields = {'activation_limit': _promo_limit(value)}
+            db(context).update_promo(promo_id, **fields)
+            context.user_data.pop('flow', None)
+            await _promo_card(update, context, promo_id)
+        elif kind == "admin_category_add":
             name = _text(value, 100, "Название категории")
             category_id = db(context).add_category(name)
             context.user_data.pop("flow", None)

@@ -208,6 +208,8 @@ async def customer_callback(update, context):
         await start(update, context)
     elif action == 'terms':
         await terms(update, context)
+    elif action == 'promo':
+        await open_promo(update, context)
     elif action == 'catalog':
         await catalogue(update, context, max(0, int(parts[1])))
     elif action == 'cat':
@@ -239,6 +241,38 @@ async def customer_callback(update, context):
         await order_page(update, context, int(parts[1]))
     else:
         raise StoreError("Эта кнопка устарела. Откройте /start.")
+
+
+async def open_promo(update, context):
+    context.user_data['flow'] = {'kind': 'promo'}
+    await show(update, "🎟 Введите промокод.\n\nОтмена: /cancel",
+               [[button("Отмена", "home")]])
+
+
+async def _activate_promo(update, context, code):
+    try:
+        db(context).activate_promo(code, update.effective_user.id)
+    except StoreError as exc:
+        await show(update, "ℹ️ " + str(exc), [[button("Отмена", "home")]])
+        return
+    context.user_data.pop('flow', None)
+    await show(update, "✅ Промокод активирован.", [[button("🏠 Главное меню", "home")]])
+
+
+async def promo_command(update, context):
+    parts = (update.effective_message.text or '').split(maxsplit=1)
+    if len(parts) == 2:
+        context.user_data['flow'] = {'kind': 'promo'}
+        await _activate_promo(update, context, parts[1])
+    else:
+        await open_promo(update, context)
+
+
+async def promo_input(update, context):
+    if context.user_data.get('flow', {}).get('kind') != 'promo':
+        return False
+    await _activate_promo(update, context, update.effective_message.text)
+    return True
 
 
 async def quantity_input(update, context):

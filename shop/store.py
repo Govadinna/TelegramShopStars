@@ -1,6 +1,7 @@
 """Persistent shop data and atomic Telegram Stars payment bookkeeping."""
 from __future__ import annotations
 
+import re
 import secrets
 import sqlite3
 from contextlib import contextmanager
@@ -22,6 +23,13 @@ DEFAULT_SETTINGS = {
 }
 STATUSES = {"pending", "awaiting_payment", "paid", "fulfilled", "refunded", "cancelled"}
 MAX_STARS = 1_000_000
+MAX_PROMO_ACTIVATIONS = 1_000_000_000
+
+
+def normalize_promo_code(value: str) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9_-]{1,64}", value.strip()):
+        raise StoreError("Промокод: введите от 1 до 64 букв, цифр, символов _ или - без пробелов.")
+    return value.strip().upper()
 
 
 def _now() -> datetime:
@@ -121,6 +129,20 @@ class Store:
                 owner_message_id INTEGER PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id)
             );
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE,
+                activation_limit INTEGER CHECK(activation_limit IS NULL OR activation_limit BETWEEN 1 AND 1000000000),
+                activation_count INTEGER NOT NULL DEFAULT 0 CHECK(activation_count BETWEEN 0 AND 1000000000),
+                active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS promo_activations (
+                promo_id INTEGER NOT NULL REFERENCES promo_codes(id) ON DELETE CASCADE,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                activated_at TEXT NOT NULL,
+                PRIMARY KEY (promo_id, user_id)
+            );
         """)
         with self._transaction():
             self._conn.executemany(
@@ -168,6 +190,84 @@ class Store:
     def list_users(self, limit: int = 10, offset: int = 0) -> list[dict]:
         limit, offset = self._page(limit, offset)
         return self._all("SELECT * FROM users ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?", (limit, offset))
+
+    def list_promos(self, limit: int = 10, offset: int = 0) -> list[dict]:
+        limit, offset = self._page(limit, offset)
+        return self._all("SELECT * FROM promo_codes ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
+
+    def get_promo(self, promo_id: int) -> dict | None:
+        return self._one(
+            "SELECT p.*, (SELECT COUNT(*) FROM promo_activations a WHERE a.promo_id=p.id) AS unique_activations "
+            "FROM promo_codes p WHERE p.id=?", (promo_id,)
+        )
+
+    def add_promo(self, code: str, activation_limit: int | None = None) -> int:
+        code = normalize_promo_code(code)
+        if activation_limit is not None:
+            activation_limit = _integer(activation_limit, "Лимит активаций", 1, MAX_PROMO_ACTIVATIONS)
+        try:
+            cursor = self._conn.execute(
+                "INSERT INTO promo_codes(code, activation_limit, created_at) VALUES (?, ?, ?)",
+                (code, activation_limit, _stamp()),
+            )
+        except sqlite3.IntegrityError:
+            raise StoreError("Такой промокод уже существует. Выберите другой код.") from None
+        return int(cursor.lastrowid)
+
+    def update_promo(self, promo_id: int, **fields) -> None:
+        if set(fields) - {"code", "activation_limit", "activation_count", "active"}:
+            raise StoreError("Неизвестная настройка промокода.")
+        if "code" in fields:
+            fields["code"] = normalize_promo_code(fields["code"])
+        if "activation_limit" in fields and fields["activation_limit"] is not None:
+            fields["activation_limit"] = _integer(fields["activation_limit"], "Лимит активаций", 1, MAX_PROMO_ACTIVATIONS)
+        if "activation_count" in fields:
+            fields["activation_count"] = _integer(fields["activation_count"], "Счётчик активаций", 0, MAX_PROMO_ACTIVATIONS)
+        if "active" in fields:
+            fields["active"] = _active(fields["active"])
+        with self._transaction():
+            if not self.get_promo(promo_id):
+                raise StoreError("Промокод удалён или не найден.")
+            if fields:
+                try:
+                    self._conn.execute(
+                        "UPDATE promo_codes SET " + ", ".join(f"{key}=?" for key in fields) + " WHERE id=?",
+                        (*fields.values(), promo_id),
+                    )
+                except sqlite3.IntegrityError:
+                    raise StoreError("Такой промокод уже существует. Выберите другой код.") from None
+
+    def delete_promo(self, promo_id: int) -> None:
+        with self._transaction():
+            if not self.get_promo(promo_id):
+                raise StoreError("Промокод удалён или не найден.")
+            self._conn.execute("DELETE FROM promo_codes WHERE id=?", (promo_id,))
+
+    def activate_promo(self, code: str, user_id: int) -> dict:
+        """Record one activation per customer; no price, stock or payment changes."""
+        code = normalize_promo_code(code)
+        user_id = _integer(user_id, "ID пользователя")
+        # Lock before checking both the user and remaining activations so two
+        # customers cannot consume the same last available activation.
+        with self._transaction():
+            promo = self._one("SELECT * FROM promo_codes WHERE code=?", (code,))
+            if not promo:
+                raise StoreError("Промокод не найден. Проверьте написание и попробуйте ещё раз.")
+            if not self.get_user(user_id):
+                raise StoreError("Сначала откройте /start.")
+            if self._one("SELECT 1 FROM promo_activations WHERE promo_id=? AND user_id=?", (promo["id"], user_id)):
+                raise StoreError("Вы уже активировали этот промокод.")
+            if not promo["active"]:
+                raise StoreError("Этот промокод отключён.")
+            limit = promo["activation_limit"]
+            if promo["activation_count"] >= (limit if limit is not None else MAX_PROMO_ACTIVATIONS):
+                raise StoreError("Лимит активаций этого промокода исчерпан.")
+            self._conn.execute(
+                "INSERT INTO promo_activations(promo_id, user_id, activated_at) VALUES (?, ?, ?)",
+                (promo["id"], user_id, _stamp()),
+            )
+            self._conn.execute("UPDATE promo_codes SET activation_count=activation_count+1 WHERE id=?", (promo["id"],))
+            return self.get_promo(promo["id"])
 
     def list_categories(self, include_hidden: bool = False) -> list[dict]:
         return self._all("SELECT * FROM categories WHERE deleted=0" + ("" if include_hidden else " AND active=1") + " ORDER BY id")

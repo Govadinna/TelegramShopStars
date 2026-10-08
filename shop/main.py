@@ -69,7 +69,7 @@ async def cancel(update, context):
 
 
 async def privacy(update, context):
-    await show(update, "🔐 Данные магазина\n\nБот сохраняет ваш Telegram ID, имя, username, заказы и сведения об оплате. "
+    await show(update, "🔐 Данные магазина\n\nБот сохраняет ваш Telegram ID, имя, username, заказы, активации промокодов и сведения об оплате. "
                "Переписка копируется в личный чат владельца. Данные нужны для выдачи покупок, ответов и возвратов. "
                "По вопросам ваших данных напишите владельцу: /support.",
                [[button("🏠 Меню", "home")]])
@@ -84,7 +84,7 @@ async def command(update, context):
                 '/orders': customer.orders_page, '/terms': customer.terms,
                 '/support': support.open_support, '/paysupport': support.open_support,
                 '/admin': admin.admin_command, '/cancel': cancel, '/id': identify,
-                '/privacy': privacy}
+                '/privacy': privacy, '/promo': customer.promo_command}
     handler = commands.get(name)
     if handler:
         context.user_data.clear()
@@ -121,6 +121,8 @@ async def incoming(update, context):
             return
         if await customer.quantity_input(update, context):
             return
+        if await customer.promo_input(update, context):
+            return
         if await support.relay_message(update, context):
             return
         await update.effective_message.reply_text("Выберите товар в /catalog или откройте /support, чтобы написать владельцу."
@@ -140,6 +142,7 @@ async def handle_error(update, context):
 
 async def post_init(application):
     commands = [BotCommand('start', 'Главное меню'), BotCommand('catalog', 'Каталог'),
+                BotCommand('promo', 'Ввести промокод'),
                 BotCommand('orders', 'Мои заказы'), BotCommand('support', 'Поддержка'),
                 BotCommand('paysupport', 'Вопросы оплаты и возвратов'), BotCommand('terms', 'Условия покупки'),
                 BotCommand('cancel', 'Отменить ввод'), BotCommand('id', 'Мой Telegram ID')]
